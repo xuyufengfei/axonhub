@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -355,6 +356,203 @@ func TestNewHttpClientWithProxy_ConnectionReuse(t *testing.T) {
 				connectionIDs[0]: {},
 				connectionIDs[1]: {},
 			}, tt.wantDistinctConnections)
+		})
+	}
+}
+
+type connectProxyTestServer struct {
+	server *httptest.Server
+
+	connects     atomic.Int64
+	activeTunnel atomic.Int64
+
+	connectionsMu sync.Mutex
+	connections   map[net.Conn]struct{}
+
+	errorsMu sync.Mutex
+	errors   []error
+}
+
+func newConnectProxyTestServer(t *testing.T) *connectProxyTestServer {
+	t.Helper()
+
+	proxy := &connectProxyTestServer{
+		connections: make(map[net.Conn]struct{}),
+	}
+	proxy.server = httptest.NewServer(http.HandlerFunc(proxy.handle))
+	t.Cleanup(func() {
+		proxy.close(t)
+	})
+
+	return proxy
+}
+
+func (p *connectProxyTestServer) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect {
+		p.recordError(fmt.Errorf("unexpected proxy method %s", r.Method))
+		http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	p.connects.Add(1)
+
+	upstreamConn, err := net.DialTimeout("tcp", r.Host, 5*time.Second)
+	if err != nil {
+		p.recordError(fmt.Errorf("dial CONNECT target %s: %w", r.Host, err))
+		http.Error(w, "failed to connect to upstream", http.StatusBadGateway)
+
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		_ = upstreamConn.Close()
+		p.recordError(fmt.Errorf("proxy response writer does not support hijacking"))
+		http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
+
+		return
+	}
+
+	clientConn, buffered, err := hijacker.Hijack()
+	if err != nil {
+		_ = upstreamConn.Close()
+		p.recordError(fmt.Errorf("hijack proxy connection: %w", err))
+
+		return
+	}
+
+	p.trackConnection(clientConn)
+	p.activeTunnel.Add(1)
+	defer func() {
+		p.activeTunnel.Add(-1)
+		p.untrackConnection(clientConn)
+		_ = clientConn.Close()
+		_ = upstreamConn.Close()
+	}()
+
+	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		p.recordError(fmt.Errorf("write CONNECT response: %w", err))
+
+		return
+	}
+	if err := buffered.Flush(); err != nil {
+		p.recordError(fmt.Errorf("flush CONNECT response: %w", err))
+
+		return
+	}
+
+	clientToUpstreamDone := make(chan struct{})
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error("CONNECT proxy copy goroutine panicked", slog.Any("panic", recovered))
+				p.recordError(fmt.Errorf("CONNECT proxy copy goroutine panicked: %v", recovered))
+			}
+			close(clientToUpstreamDone)
+		}()
+
+		_, _ = io.Copy(upstreamConn, buffered)
+		_ = upstreamConn.Close()
+	}()
+
+	_, _ = io.Copy(clientConn, upstreamConn)
+	_ = clientConn.Close()
+	<-clientToUpstreamDone
+}
+
+func (p *connectProxyTestServer) trackConnection(conn net.Conn) {
+	p.connectionsMu.Lock()
+	defer p.connectionsMu.Unlock()
+
+	p.connections[conn] = struct{}{}
+}
+
+func (p *connectProxyTestServer) untrackConnection(conn net.Conn) {
+	p.connectionsMu.Lock()
+	defer p.connectionsMu.Unlock()
+
+	delete(p.connections, conn)
+}
+
+func (p *connectProxyTestServer) recordError(err error) {
+	p.errorsMu.Lock()
+	defer p.errorsMu.Unlock()
+
+	p.errors = append(p.errors, err)
+}
+
+func (p *connectProxyTestServer) close(t *testing.T) {
+	t.Helper()
+
+	p.server.Close()
+
+	p.connectionsMu.Lock()
+	connections := make([]net.Conn, 0, len(p.connections))
+	for conn := range p.connections {
+		connections = append(connections, conn)
+	}
+	p.connectionsMu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+
+	require.Eventually(t, func() bool {
+		return p.activeTunnel.Load() == 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	p.errorsMu.Lock()
+	proxyErrors := append([]error(nil), p.errors...)
+	p.errorsMu.Unlock()
+	require.Empty(t, proxyErrors)
+}
+
+func TestNewHttpClientWithProxy_HTTPSConnectionReuse(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+
+	tests := []struct {
+		name                   string
+		disableConnectionReuse bool
+		wantConnects           int64
+	}{
+		{
+			name:         "reuses CONNECT tunnel by default",
+			wantConnects: 1,
+		},
+		{
+			name:                   "opens a new CONNECT tunnel for every request when disabled",
+			disableConnectionReuse: true,
+			wantConnects:           2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := newConnectProxyTestServer(t)
+			client := NewHttpClientWithProxy(&ProxyConfig{
+				Type:                   ProxyTypeURL,
+				URL:                    proxy.server.URL,
+				DisableConnectionReuse: tt.disableConnectionReuse,
+			}, WithInsecureSkipVerify(true))
+			t.Cleanup(client.CloseIdleConnections)
+
+			for range 2 {
+				response, err := client.Do(t.Context(), &Request{
+					Method: http.MethodGet,
+					URL:    upstream.URL,
+				})
+				require.NoError(t, err)
+				require.JSONEq(t, `{"ok":true}`, string(response.Body))
+			}
+
+			require.Equal(t, tt.wantConnects, proxy.connects.Load())
 		})
 	}
 }
